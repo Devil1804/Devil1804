@@ -1,0 +1,15 @@
+# Render Blueprint — deploy FetchWave as a Docker web service.
+# In Render: New + -> Blueprint -> pick this repo. Render reads this file.
+services:
+  - type: web
+    name: fetchwave
+    runtime: docker
+    # The app lives in a subfolder of the repo; build from there.
+    rootDir: video-downloader
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
