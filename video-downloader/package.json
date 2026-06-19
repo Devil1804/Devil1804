@@ -1,0 +1,22 @@
+{
+  "name": "modern-video-downloader",
+  "version": "1.0.0",
+  "description": "A modern Instagram & YouTube video downloader with a smooth, animated UI, powered by yt-dlp. Zero npm dependencies.",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "keywords": [
+    "youtube",
+    "instagram",
+    "video",
+    "downloader",
+    "yt-dlp"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
