@@ -82,6 +82,34 @@ PORT=8080 YTDLP_PATH="/usr/local/bin/yt-dlp" npm start
 
 ---
 
+## Cookies (optional, recommended for cloud hosting)
+
+YouTube often blocks datacenter IPs ("Sign in to confirm you're not a bot"),
+and some Instagram content requires a logged-in session. To handle this,
+FetchWave will **automatically use a cookies file if one is present** — and
+work exactly as normal if it isn't.
+
+1. Export cookies in **Netscape format** from a logged-in browser session
+   (e.g. the "Get cookies.txt LOCALLY" browser extension) into `cookies.txt`.
+2. Make it available to the server in one of two ways:
+   - Place it at `/etc/secrets/cookies.txt` (the default — matches Render's
+     Secret Files), **or**
+   - Point `COOKIES_FILE` at any path:
+     ```bash
+     COOKIES_FILE="/path/to/cookies.txt" npm start
+     ```
+
+On startup the server logs whether cookies were detected, and
+`GET /api/health` reports `{ "cookies": true|false }`. When a cookies file is
+found it's passed to every `yt-dlp` call via `--cookies`; otherwise nothing
+changes.
+
+> On **Render**: Service → **Settings → Secret Files** → add a file named
+> `cookies.txt`. It's mounted at `/etc/secrets/cookies.txt`, which is the
+> default path — no extra config needed.
+
+---
+
 ## How it works
 
 ```

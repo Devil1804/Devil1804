@@ -13,6 +13,30 @@ const PORT = process.env.PORT || 3000;
 const YT_DLP = process.env.YTDLP_PATH || "yt-dlp";
 const JOB_TTL_MS = 15 * 60 * 1000; // auto-clean abandoned jobs after 15 min
 
+// Optional cookies: if a Netscape-format cookies file exists, yt-dlp uses it
+// (helps with YouTube bot checks / private or age-restricted content). If it's
+// missing, the app works exactly as before with no cookies.
+// On Render, add a Secret File named "cookies.txt" (mounted at /etc/secrets/)
+// or set COOKIES_FILE to a custom path.
+const COOKIES_FILE = process.env.COOKIES_FILE || "/etc/secrets/cookies.txt";
+
+/** Returns ["--cookies", path] when a usable cookies file is present, else []. */
+function cookieArgs() {
+  try {
+    if (COOKIES_FILE && fs.statSync(COOKIES_FILE).size > 0) {
+      return ["--cookies", COOKIES_FILE];
+    }
+  } catch {
+    /* file not present — fall through to no cookies */
+  }
+  return [];
+}
+
+/** True if cookies are currently available (used for startup logging). */
+function cookiesPresent() {
+  return cookieArgs().length > 0;
+}
+
 /* ----------------------------- helpers ----------------------------- */
 
 const URL_RE = /^https?:\/\/[^\s]+$/i;
@@ -262,6 +286,7 @@ function startDownloadJob({ url, formatId, mode, titleHint }) {
     "%(info.playlist_index)s\t%(info.playlist_count)s\t%(info.title)s";
 
   const args = [
+    ...cookieArgs(),
     "--no-warnings",
     "--newline",
     "--progress-template",
@@ -444,7 +469,13 @@ async function handleInfo(req, res) {
 
   try {
     // --flat-playlist makes playlist probing fast; for single videos it's a no-op.
-    const out = await runYtDlp(["-J", "--flat-playlist", "--no-warnings", url.trim()]);
+    const out = await runYtDlp([
+      ...cookieArgs(),
+      "-J",
+      "--flat-playlist",
+      "--no-warnings",
+      url.trim(),
+    ]);
     const meta = JSON.parse(out);
     if (meta._type === "playlist" && Array.isArray(meta.entries)) {
       sendJson(res, 200, shapePlaylistInfo(meta));
@@ -544,7 +575,7 @@ const server = http.createServer((req, res) => {
   if (req.method === "GET" && file) return handleFile(req, res, file[1]);
 
   if (req.method === "GET" && pathname === "/api/health") {
-    return sendJson(res, 200, { ok: true, jobs: jobs.size });
+    return sendJson(res, 200, { ok: true, jobs: jobs.size, cookies: cookiesPresent() });
   }
   if (req.method === "GET") return serveStatic(req, res);
 
@@ -552,5 +583,10 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`\n  FetchWave running at http://localhost:${PORT}\n`);
+  console.log(`\n  FetchWave running at http://localhost:${PORT}`);
+  console.log(
+    cookiesPresent()
+      ? `  Cookies: enabled (${COOKIES_FILE})\n`
+      : `  Cookies: none found — running without cookies\n`
+  );
 });
