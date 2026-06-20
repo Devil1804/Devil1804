@@ -1,20 +1,7 @@
-# Render Blueprint — deploys both FetchWave services as Docker web services.
+# Render Blueprint — deploys the FetchWave Telegram bot.
 # In Render: New + -> Blueprint -> pick this repo. Render reads this file.
 services:
-  # 1) The web app (browser UI + download API)
-  - type: web
-    name: fetchwave-web
-    runtime: docker
-    rootDir: video-downloader
-    dockerfilePath: ./Dockerfile
-    plan: free
-    healthCheckPath: /api/health
-    autoDeploy: true
-    envVars:
-      - key: NODE_ENV
-        value: production
-
-  # 2) The Telegram bot (runs a Flask keep-alive server so it can be a web service)
+  # Telegram bot (runs a Flask keep-alive server so it can be a web service)
   - type: web
     name: fetchwave-bot
     runtime: docker
