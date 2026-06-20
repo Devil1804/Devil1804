@@ -1,10 +1,10 @@
-# Render Blueprint — deploy FetchWave as a Docker web service.
+# Render Blueprint — deploys both FetchWave services as Docker web services.
 # In Render: New + -> Blueprint -> pick this repo. Render reads this file.
 services:
+  # 1) The web app (browser UI + download API)
   - type: web
-    name: fetchwave
+    name: fetchwave-web
     runtime: docker
-    # The app lives in a subfolder of the repo; build from there.
     rootDir: video-downloader
     dockerfilePath: ./Dockerfile
     plan: free
@@ -13,3 +13,23 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+
+  # 2) The Telegram bot (runs a Flask keep-alive server so it can be a web service)
+  - type: web
+    name: fetchwave-bot
+    runtime: docker
+    rootDir: telegram-bot
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      # Set these secret values in the Render dashboard (sync:false = prompt, don't store in repo).
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: AUTO_DELETE_SECONDS
+        value: "300"
+      - key: MAX_DOWNLOAD_MB
+        value: "500"

@@ -1,6 +1,7 @@
 FROM python:3.12-slim
 
-# ffmpeg is required by yt-dlp for merging video+audio and MP3 conversion.
+# ffmpeg (and ffprobe) are required by yt-dlp for merging and by the bot for
+# compressing oversized files to fit Telegram's 50 MB limit.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg \
  && rm -rf /var/lib/apt/lists/*
@@ -11,5 +12,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
+
+# The bot runs a Flask keep-alive server on $PORT (Render/Railway inject it).
+ENV PORT=8080
+EXPOSE 8080
 
 CMD ["python", "bot.py"]
