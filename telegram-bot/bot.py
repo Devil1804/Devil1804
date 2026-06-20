@@ -2,17 +2,18 @@
 FetchWave Telegram Bot
 ======================
 
-A Telethon bot (logs in with a BOT TOKEN) that:
-  - accepts a YouTube or Instagram link
-  - auto-verifies the link
+A bot-token-only bot (uses the HTTP Bot API via python-telegram-bot — NO api_id
+or api_hash needed) that:
+  - accepts a YouTube or Instagram link and auto-verifies it
   - lets the user pick a quality via inline buttons
-  - downloads with yt-dlp showing a LIVE progress bar (download + upload)
-  - sends the file back and reminds the user to forward it to Saved Messages
+  - downloads with yt-dlp showing a LIVE progress bar
+  - sends the file back (max 50 MB — the Telegram Bot API limit for bots)
+  - reminds the user to forward it to Saved Messages
   - auto-deletes the link message, status messages and the video after N minutes
   - logs every request to an admin (name, user id, username, phone if shared)
 
-Requires: telethon, yt-dlp  (and ffmpeg on the system for merging/MP3).
-Env vars: API_ID, API_HASH, BOT_TOKEN, ADMIN_ID, AUTO_DELETE_SECONDS, COOKIES_FILE
+Requires: python-telegram-bot, yt-dlp  (and ffmpeg on the system).
+Env vars: BOT_TOKEN, ADMIN_ID, AUTO_DELETE_SECONDS, COOKIES_FILE
 """
 
 import asyncio
@@ -22,28 +23,45 @@ import re
 import secrets
 import shutil
 import tempfile
-import time
 from urllib.parse import urlparse
 
-from telethon import Button, TelegramClient, events
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 import yt_dlp
 
 # --------------------------------------------------------------------------- #
-# Configuration
+# Configuration  (BOT TOKEN ONLY — no api_id / api_hash)
 # --------------------------------------------------------------------------- #
 
-API_ID = int(os.environ.get("API_ID", "0") or 0)
-API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0") or 0)
 AUTO_DELETE = int(os.environ.get("AUTO_DELETE_SECONDS", "300"))  # 5 minutes
 COOKIES_FILE = os.environ.get("COOKIES_FILE", "/etc/secrets/cookies.txt")
 
-if not (API_ID and API_HASH and BOT_TOKEN):
+# Telegram Bot API hard limit for files a bot can SEND.
+MAX_BYTES = 50 * 1024 * 1024  # 50 MB
+MAX_LABEL = "50 MB"
+
+if not BOT_TOKEN:
     raise SystemExit(
-        "Missing config. Set API_ID, API_HASH and BOT_TOKEN environment variables.\n"
-        "Get API_ID/API_HASH from https://my.telegram.org and BOT_TOKEN from @BotFather."
+        "Missing config. Set the BOT_TOKEN environment variable "
+        "(get it from @BotFather on Telegram)."
     )
 
 ALLOWED_HOSTS = (
@@ -57,7 +75,6 @@ ALLOWED_HOSTS = (
 
 URL_RE = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 
-# Format selectors offered via inline buttons.
 FORMATS = {
     "best": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
     "1080": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
@@ -68,17 +85,16 @@ WELCOME = (
     "<b>👋 Welcome to FetchWave</b>\n\n"
     "Send me a <b>YouTube</b> or <b>Instagram</b> link and I'll download it for you "
     "with a live progress bar.\n\n"
-    "⚠️ The file <b>auto-deletes in {mins} minutes</b>, so forward it to your "
-    "<b>Saved Messages</b> right away.\n\n"
-    "You can optionally share your number below (used only for support)."
-).format(mins=AUTO_DELETE // 60)
+    f"📦 <b>Max file size: {MAX_LABEL}</b> (Telegram's limit for bots). "
+    "For long videos, pick a lower quality or <b>🎵 MP3</b>.\n\n"
+    f"⚠️ The file <b>auto-deletes in {AUTO_DELETE // 60} minutes</b> — forward it to "
+    "your <b>Saved Messages</b> right away.\n\n"
+    "You can optionally share your number below."
+)
 
 # In-memory stores
-PENDING = {}      # token -> {url, chat, msg, user}
-PHONES = {}       # user_id -> phone number (only if user shared it)
-
-client = TelegramClient("fetchwave_bot", API_ID, API_HASH)
-client.parse_mode = "html"
+PENDING = {}   # token -> {url, chat, msg, user}
+PHONES = {}    # user_id -> phone number (only if user shared it)
 
 
 # --------------------------------------------------------------------------- #
@@ -121,21 +137,23 @@ def bar(pct) -> str:
     return "▰" * filled + "▱" * (10 - filled)
 
 
-def quality_buttons(token: str):
-    return [
+def quality_buttons(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
         [
-            Button.inline("🎬 Best", f"dl|{token}|best".encode()),
-            Button.inline("1080p", f"dl|{token}|1080".encode()),
-        ],
-        [
-            Button.inline("720p", f"dl|{token}|720".encode()),
-            Button.inline("🎵 MP3", f"dl|{token}|mp3".encode()),
-        ],
-        [Button.inline("❌ Cancel", f"cancel|{token}".encode())],
-    ]
+            [
+                InlineKeyboardButton("🎬 Best", callback_data=f"dl|{token}|best"),
+                InlineKeyboardButton("1080p", callback_data=f"dl|{token}|1080"),
+            ],
+            [
+                InlineKeyboardButton("720p", callback_data=f"dl|{token}|720"),
+                InlineKeyboardButton("🎵 MP3", callback_data=f"dl|{token}|mp3"),
+            ],
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel|{token}")],
+        ]
+    )
 
 
-def render_status(state: dict, fmt: str) -> str:
+def render_status(state: dict) -> str:
     status = state.get("status")
     if status in (None, "starting"):
         return "⏳ <b>Preparing download…</b>"
@@ -143,9 +161,7 @@ def render_status(state: dict, fmt: str) -> str:
         return "⚙️ <b>Processing / merging…</b>\n" + bar(100)
 
     pct = state.get("percent")
-    head = (
-        f"⬇️ <b>Downloading…</b> {pct:.0f}%" if pct is not None else "⬇️ <b>Downloading…</b>"
-    )
+    head = f"⬇️ <b>Downloading…</b> {pct:.0f}%" if pct is not None else "⬇️ <b>Downloading…</b>"
     lines = [head, bar(pct if pct is not None else 0)]
     extra = []
     if state.get("total"):
@@ -159,11 +175,18 @@ def render_status(state: dict, fmt: str) -> str:
     return "\n".join(lines)
 
 
-async def safe_edit(msg, text, buttons=None):
+async def safe_edit(bot, chat_id, msg_id, text, reply_markup=None):
     try:
-        await msg.edit(text, buttons=buttons)
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
     except Exception:
-        pass  # ignore "message not modified" / flood etc.
+        pass  # ignore "message is not modified" / flood, etc.
 
 
 def build_ydl_opts(fmt_key: str, tmpdir: str, hook):
@@ -173,9 +196,9 @@ def build_ydl_opts(fmt_key: str, tmpdir: str, hook):
         "quiet": True,
         "no_warnings": True,
         "progress_hooks": [hook],
-        "restrictfilenames": False,
+        # Guard so we don't waste bandwidth pulling files over the limit.
+        "max_filesize": MAX_BYTES,
     }
-    # Optional cookies — only if the file actually exists and is non-empty.
     try:
         if COOKIES_FILE and os.path.getsize(COOKIES_FILE) > 0:
             opts["cookiefile"] = COOKIES_FILE
@@ -213,37 +236,42 @@ def do_download(url: str, fmt_key: str, tmpdir: str, state: dict):
         ydl.extract_info(url, download=True)
 
 
-async def notify_admin(sender, url: str):
+async def notify_admin(context, user, url: str):
     if not ADMIN_ID:
         return
-    phone = PHONES.get(sender.id) or getattr(sender, "phone", None) or "N/A"
-    uname = f"@{sender.username}" if getattr(sender, "username", None) else "N/A"
-    name = " ".join(
-        filter(None, [getattr(sender, "first_name", ""), getattr(sender, "last_name", "")])
-    ) or "N/A"
+    phone = PHONES.get(user.id) or "N/A"
+    uname = f"@{user.username}" if user.username else "N/A"
+    name = " ".join(filter(None, [user.first_name, user.last_name])) or "N/A"
     text = (
         "📥 <b>New download request</b>\n\n"
         f"👤 <b>Name:</b> {html.escape(name)}\n"
-        f"🆔 <b>User ID:</b> <code>{sender.id}</code>\n"
+        f"🆔 <b>User ID:</b> <code>{user.id}</code>\n"
         f"🔗 <b>Username:</b> {html.escape(uname)}\n"
         f"📱 <b>Phone:</b> {html.escape(str(phone))}\n\n"
         f"🌐 <b>Link:</b> {html.escape(url)}"
     )
     try:
-        await client.send_message(
-            ADMIN_ID, text, buttons=[[Button.url("🔗 Open link", url)]], link_preview=False
+        await context.bot.send_message(
+            ADMIN_ID,
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Open link", url=url)]]),
+            disable_web_page_preview=True,
         )
     except Exception:
         pass
 
 
-async def autodelete(chat_id, message_ids, token):
+async def autodelete(context, chat_id, message_ids, token):
     """Delete the link msg, status msg and the video after AUTO_DELETE seconds."""
     await asyncio.sleep(AUTO_DELETE)
-    try:
-        await client.delete_messages(chat_id, [m for m in message_ids if m])
-    except Exception:
-        pass
+    for mid in message_ids:
+        if not mid:
+            continue
+        try:
+            await context.bot.delete_message(chat_id, mid)
+        except Exception:
+            pass
     PENDING.pop(token, None)
 
 
@@ -251,79 +279,81 @@ async def autodelete(chat_id, message_ids, token):
 # Handlers
 # --------------------------------------------------------------------------- #
 
-@client.on(events.NewMessage(incoming=True))
-async def on_message(event):
-    msg = event.message
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = ReplyKeyboardMarkup(
+        [[KeyboardButton("📱 Share my number (optional)", request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await update.message.reply_text(WELCOME, parse_mode=ParseMode.HTML, reply_markup=kb)
 
-    # 1) user shared their contact (phone)
-    if msg.contact:
-        PHONES[event.sender_id] = msg.contact.phone_number
-        await event.reply(
-            "📱 Thanks, your number is saved. Now send me a link!",
-            buttons=Button.clear(),
-        )
-        return
 
-    text = (event.raw_text or "").strip()
+async def on_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    contact = update.message.contact
+    PHONES[update.effective_user.id] = contact.phone_number
+    await update.message.reply_text(
+        "📱 Thanks, your number is saved. Now send me a link!",
+        reply_markup=ReplyKeyboardRemove(),
+    )
 
-    # 2) commands
-    if text.startswith("/start") or text.startswith("/help"):
-        await event.reply(
-            WELCOME,
-            buttons=[[Button.request_phone("📱 Share my number (optional)")]],
-            link_preview=False,
-        )
-        return
 
-    # 3) find & verify a link
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
     match = URL_RE.search(text)
     if not match:
-        await event.reply("🔗 Send me a <b>YouTube</b> or <b>Instagram</b> link.")
+        await update.message.reply_text(
+            "🔗 Send me a <b>YouTube</b> or <b>Instagram</b> link.", parse_mode=ParseMode.HTML
+        )
         return
 
     url = match.group(0)
     if not valid_link(url):
-        await event.reply("❌ Only <b>YouTube</b> and <b>Instagram</b> links are supported.")
+        await update.message.reply_text(
+            "❌ Only <b>YouTube</b> and <b>Instagram</b> links are supported.",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     platform = detect_platform(url)
-    sender = await event.get_sender()
-    await notify_admin(sender, url)
+    await notify_admin(context, update.effective_user, url)
 
     token = secrets.token_urlsafe(8)
     PENDING[token] = {
         "url": url,
-        "chat": event.chat_id,
-        "msg": event.id,
-        "user": event.sender_id,
+        "chat": update.effective_chat.id,
+        "msg": update.message.message_id,
+        "user": update.effective_user.id,
     }
-    await event.reply(
-        f"✅ <b>{platform}</b> link verified!\nChoose a format below 👇",
-        buttons=quality_buttons(token),
-        link_preview=False,
+    await update.message.reply_text(
+        f"✅ <b>{platform}</b> link verified!\n"
+        f"Choose a format below 👇  (max <b>{MAX_LABEL}</b>)",
+        parse_mode=ParseMode.HTML,
+        reply_markup=quality_buttons(token),
     )
 
 
-@client.on(events.CallbackQuery(pattern=rb"cancel\|"))
-async def on_cancel(event):
-    token = event.data.decode().split("|", 1)[1]
+async def on_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    token = query.data.split("|", 1)[1]
     PENDING.pop(token, None)
-    await event.edit("❌ Cancelled.")
+    await query.answer()
+    await safe_edit(context.bot, query.message.chat_id, query.message.message_id, "❌ Cancelled.")
 
 
-@client.on(events.CallbackQuery(pattern=rb"dl\|"))
-async def on_download(event):
-    _, token, fmt_key = event.data.decode().split("|")
+async def on_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    _, token, fmt_key = query.data.split("|")
     item = PENDING.get(token)
     if not item:
-        await event.answer("This request expired — please send the link again.", alert=True)
+        await query.answer("This request expired — please send the link again.", show_alert=True)
         return
 
-    await event.answer("Starting…")
+    await query.answer("Starting…")
     url = item["url"]
+    chat_id = query.message.chat_id
+    status_id = query.message.message_id
 
-    # The message that held the buttons becomes our live status message.
-    status = await event.edit("⏳ <b>Preparing download…</b>")
+    await safe_edit(context.bot, chat_id, status_id, "⏳ <b>Preparing download…</b>")
 
     state = {"status": "starting"}
     done = asyncio.Event()
@@ -331,15 +361,15 @@ async def on_download(event):
     async def updater():
         last = ""
         while not done.is_set():
-            txt = render_status(state, fmt_key)
+            txt = render_status(state)
             if txt != last:
-                await safe_edit(status, txt)
+                await safe_edit(context.bot, chat_id, status_id, txt)
                 last = txt
             await asyncio.sleep(3)
 
     upd_task = asyncio.create_task(updater())
     tmpdir = tempfile.mkdtemp(prefix="tgdl-")
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     # ---- download ----
     try:
@@ -347,7 +377,18 @@ async def on_download(event):
     except Exception as exc:
         done.set()
         upd_task.cancel()
-        await safe_edit(status, f"❌ <b>Download failed.</b>\n<code>{html.escape(str(exc))[:300]}</code>")
+        msg = str(exc)
+        if "max-filesize" in msg.lower() or "larger than" in msg.lower():
+            await safe_edit(
+                context.bot, chat_id, status_id,
+                f"❌ <b>Too big for Telegram</b> (limit {MAX_LABEL}).\n"
+                "Try <b>720p</b> or <b>🎵 MP3</b> instead.",
+            )
+        else:
+            await safe_edit(
+                context.bot, chat_id, status_id,
+                f"❌ <b>Download failed.</b>\n<code>{html.escape(msg)[:300]}</code>",
+            )
         shutil.rmtree(tmpdir, ignore_errors=True)
         return
 
@@ -357,62 +398,68 @@ async def on_download(event):
     except Exception:
         pass
 
-    files = [
-        f for f in os.listdir(tmpdir) if not f.endswith((".part", ".ytdl"))
-    ]
+    files = [f for f in os.listdir(tmpdir) if not f.endswith((".part", ".ytdl"))]
     if not files:
-        await safe_edit(status, "❌ No output file was produced.")
+        # Usually means the max_filesize guard skipped it.
+        await safe_edit(
+            context.bot, chat_id, status_id,
+            f"❌ <b>This video exceeds the {MAX_LABEL} limit</b> Telegram allows for bots.\n"
+            "Pick a lower quality (e.g. <b>720p</b>) or <b>🎵 MP3</b>.",
+        )
         shutil.rmtree(tmpdir, ignore_errors=True)
         return
+
     filepath = os.path.join(tmpdir, files[0])
+    size = os.path.getsize(filepath)
 
-    # ---- upload with progress ----
-    await safe_edit(status, "📤 <b>Uploading to Telegram…</b>")
-    last_up = [0.0]
+    # Final hard check against the 50 MB limit.
+    if size > MAX_BYTES:
+        await safe_edit(
+            context.bot, chat_id, status_id,
+            f"❌ <b>File is {human(size)}</b>, over Telegram's <b>{MAX_LABEL}</b> bot limit.\n"
+            "Try <b>720p</b> or <b>🎵 MP3</b> instead.",
+        )
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return
 
-    def up_cb(current, total):
-        now = time.time()
-        if now - last_up[0] >= 3:
-            last_up[0] = now
-            pct = (current / total * 100) if total else 0
-            try:
-                asyncio.create_task(
-                    safe_edit(status, f"📤 <b>Uploading…</b> {pct:.0f}%\n{bar(pct)}")
-                )
-            except RuntimeError:
-                pass
-
+    # ---- upload ----
+    await safe_edit(context.bot, chat_id, status_id, f"📤 <b>Uploading… ({human(size)})</b>")
     caption = (
         "✅ <b>Here's your file!</b>\n\n"
         f"⚠️ <b>Forward it to your Saved Messages now</b> — it will be "
         f"auto-deleted in <b>{AUTO_DELETE // 60} min</b>."
     )
+    src_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Source", url=url)]])
+
     try:
-        sent = await client.send_file(
-            item["chat"],
-            filepath,
-            caption=caption,
-            supports_streaming=True,
-            progress_callback=up_cb,
-            buttons=[[Button.url("🔗 Source", url)]],
-        )
+        with open(filepath, "rb") as fh:
+            if fmt_key == "mp3":
+                sent = await context.bot.send_audio(
+                    chat_id, fh, caption=caption, parse_mode=ParseMode.HTML, reply_markup=src_btn
+                )
+            else:
+                sent = await context.bot.send_video(
+                    chat_id, fh, caption=caption, parse_mode=ParseMode.HTML,
+                    supports_streaming=True, reply_markup=src_btn,
+                )
     except Exception as exc:
-        await safe_edit(status, f"❌ <b>Upload failed.</b>\n<code>{html.escape(str(exc))[:300]}</code>")
+        await safe_edit(
+            context.bot, chat_id, status_id,
+            f"❌ <b>Upload failed.</b>\n<code>{html.escape(str(exc))[:300]}</code>",
+        )
         shutil.rmtree(tmpdir, ignore_errors=True)
         return
 
-    # delete the local temp file immediately
     shutil.rmtree(tmpdir, ignore_errors=True)
 
     await safe_edit(
-        status,
+        context.bot, chat_id, status_id,
         f"✅ <b>Sent!</b> Forward it to <b>Saved Messages</b> — everything here "
         f"auto-deletes in {AUTO_DELETE // 60} min. 🗑",
     )
 
-    # schedule deletion of: original link msg, status msg, the video
-    ids = [item.get("msg"), status.id, sent.id]
-    asyncio.create_task(autodelete(item["chat"], ids, token))
+    ids = [item.get("msg"), status_id, sent.message_id]
+    asyncio.create_task(autodelete(context, chat_id, ids, token))
 
 
 # --------------------------------------------------------------------------- #
@@ -420,16 +467,24 @@ async def on_download(event):
 # --------------------------------------------------------------------------- #
 
 def main():
-    print("Starting FetchWave Telegram bot…")
+    print("Starting FetchWave Telegram bot (bot-token only)…")
+    print(f"  Max file size: {MAX_LABEL}")
     print(f"  Auto-delete after: {AUTO_DELETE}s")
     try:
         if COOKIES_FILE and os.path.getsize(COOKIES_FILE) > 0:
             print(f"  Cookies: enabled ({COOKIES_FILE})")
     except OSError:
         print("  Cookies: none found — running without cookies")
-    client.start(bot_token=BOT_TOKEN)
+
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler(["start", "help"], cmd_start))
+    app.add_handler(MessageHandler(filters.CONTACT, on_contact))
+    app.add_handler(CallbackQueryHandler(on_cancel, pattern=r"^cancel\|"))
+    app.add_handler(CallbackQueryHandler(on_download, pattern=r"^dl\|"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
+
     print("  Bot is online. Press Ctrl+C to stop.")
-    client.run_until_disconnected()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
